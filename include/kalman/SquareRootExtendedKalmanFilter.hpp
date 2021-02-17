@@ -22,6 +22,8 @@
 #ifndef KALMAN_SQUAREROOTEXTENDEDKALMANFILTER_HPP_
 #define KALMAN_SQUAREROOTEXTENDEDKALMANFILTER_HPP_
 
+#include <iostream>
+
 #include "KalmanFilterBase.hpp"
 #include "SquareRootFilterBase.hpp"
 #include "LinearizedSystemModel.hpp"
@@ -130,23 +132,8 @@ namespace Kalman {
         const State& update( MeasurementModelType<Measurement, CovarianceBase>& m, const Measurement& z )
         {
             m.updateJacobians( x );
-            
-            // COMPUTE KALMAN GAIN
-            // compute innovation covariance
-            CovarianceSquareRoot<Measurement> S_y;
-            computePredictedCovarianceSquareRoot<Measurement>(m.H, S, m.V, m.getCovarianceSquareRoot(), S_y);
-            
-            // compute kalman gain
-            KalmanGain<Measurement> K;
-            computeKalmanGain<Measurement>(m.H, S_y, K);
-            
-            // UPDATE STATE ESTIMATE AND COVARIANCE
-            // Update state using computed kalman gain and innovation
-            x += K * ( z - m.h( x ) );
-            
-            // Update covariance
-            updateStateCovariance<Measurement>(K, m.H);
-            
+            updateStateAndCovariance(z, m);
+
             // return updated state estimate
             return this->getState();
         }
@@ -195,9 +182,6 @@ namespace Kalman {
          *
          *     \f[ \begin{bmatrix} FS & W\sqrt{Q} \end{bmatrix}^T = \begin{bmatrix} S^T F^T \\ \sqrt{Q}^T W^T \end{bmatrix} \in \mathbb{R}^{2n \times n} \f]
          * 
-         * The same can be applied for the innovation covariance by replacing the jacobians and
-         * the noise covariance accordingly.
-         * 
          * @param [in] A The jacobian of state transition or measurement function w.r.t. state or measurement
          * @param [in] S The state covariance (as square root)
          * @param [in] B The jacobian of state transition or measurement function w.r.t. state or measurement
@@ -212,67 +196,66 @@ namespace Kalman {
         {
             // Compute QR decomposition of (transposed) augmented matrix
             Matrix<T, State::RowsAtCompileTime + Type::RowsAtCompileTime, Type::RowsAtCompileTime> tmp;
-            tmp.template topRows<State::RowsAtCompileTime>()   = S.matrixU() * A.transpose();
-            tmp.template bottomRows<Type::RowsAtCompileTime>() = R.matrixU() * B.transpose();
-            
-            // TODO: Use ColPivHouseholderQR
-            Eigen::HouseholderQR<decltype(tmp)> qr( tmp );
-            
+            tmp.template topRows<State::RowsAtCompileTime>().transpose()   = A * S.matrixL();
+            tmp.template bottomRows<Type::RowsAtCompileTime>().transpose() = B * R.matrixL();
+
+            // Inplace QR decomposition.
+            Eigen::HouseholderQR<Eigen::Ref<decltype(tmp)>> qr( tmp );
+
             // Set S_pred matrix as upper triangular square root
-            S_pred.setU(qr.matrixQR().template topRightCorner<Type::RowsAtCompileTime, Type::RowsAtCompileTime>());
+            S_pred.setU(tmp.template topRightCorner<Type::RowsAtCompileTime, Type::RowsAtCompileTime>());
             return true;
         }
-        
+
         /**
-         * @brief Compute Kalman gain from state covariance, innovation covariance and measurement jacobian
-         * 
-         * The formula for the kalman gain using square-root covariances can be deduced from the
-         * original update formula
+         * Update the state and compute its new covariance.
          *
-         *      \f[ K = P H^T P_{yy}^{-1} \Leftrightarrow K P_{yy} = P H^T \f]
-         * 
-         * with \f$P_yy\f$ being the innovation covariance. With \f$P = SS^T\f$ and \f$P_yy = S_yS_y^T\f$
-         * and transposition of the whole equation the above can be formulated as
+         * The evaluation evaluates the Kalman gain and the new covariance simultaneously
+         * as follows: compose a block matrix
+         *  \f[M = \begin{bmatrix} \sqrt{M}^T & 0 \\ \sqrt{S}^T H^T \sqrt{S}^T\end{bmatrix}\f]
+         * and evaluate its square
+         *  \f[M^TM = \begin{bmatrix} M+H S H^T & H S \\ S H^T & S \end{bmatrix}\f]
+         * to identify the building blocks for the (non-square-root) Kalman update.
+         * Perform a \f$QR\f$ decomposition to obtain
+         *   \f[M = QR =: Q\begin{bmatrix} A B \\ 0 C\end{matrix}]
+         * with \f$A, C\f$ upper triangular.  Forming the square in this form
+         *   \f[M^TM = R^TQ^TQR = R^TR = \begin{bmatrix} A^TA & A^TB \\ B^TA & B^TB+C^TC\end{bmatrix}\f],
+         * and comparing to the above epression, we can identify the components of
+         * \f$R\f$ to find the Kalman gain \f$K = B^T(A^T)^{-1}\f$ and the updated
+         * covariance matrix square root \f$C = \sqrt{S_{up}}\f$.
          *
-         *  \f{align*}{
-         *      K (S_yS_y^T) &= SS^TH^T \\
-         *      (K(S_yS_y^T))^T &= (SS^TH^T)^T \\
-         *      (S_yS_y^T)^TK^T &= H(SS^T)^T \\
-         *      \underbrace{S_yS_y^T}_{=P_{yy}} K^T &= HSS^T
-         *  \f}
-         * 
-         * Since \f$S_y\f$ is lower triangular, the above can be solved using backsubstitution
-         * in an efficient manner.
+         * The implementation tries to find an efficient way through the maze of
+         * transposes, it essentially does a LQ decomposition instead of a QR
+         * decomposition thus hiding all the transposes in the above.  This is
+         * in line with our storage format where the square roots are the lower
+         * matrices.  Finally, we use a triangular solver instead of inverting
+         * \f$A\f$, so the Kalman gain matrix is never explicitly evaluated.
          *
-         * @param [in] H The jacobian of the measurement function w.r.t. the state
-         * @param [in] S_y The Innovation covariance square root
-         * @param [out] K The computed Kalman Gain
+         * @param [in] z The measurement according which we update
+         * @param [in] m The corresponding model
          */
-        template<class Measurement>
-        bool computeKalmanGain( const Jacobian<Measurement, State>& H,
-                                const CovarianceSquareRoot<Measurement>& S_y,
-                                KalmanGain<Measurement>& K)
+        template<class Measurement, template<class> class CovarianceBase>
+        void updateStateAndCovariance(const Measurement& z, const MeasurementModelType<Measurement, CovarianceBase>& m)
         {
-            // Solve using backsubstitution
-            // AX=B with B = HSS^T and X = K^T and A = S_yS_y^T
-            K = S_y.solve(H*S.reconstructedMatrix()).transpose();
-            return true;
-        }
-        
-        /**
-         * @brief Update state covariance using Kalman gain
-         *
-         * @param [in] K The Kalman gain
-         * @param [in] H The jacobian of the measurement function w.r.t. the state
-         */
-        template<class Measurement>
-        bool updateStateCovariance( const KalmanGain<Measurement>& K,
-                                    const Jacobian<Measurement, State>& H)
-        {
-            // TODO: update covariance without using decomposition
-            Matrix<T, State::RowsAtCompileTime, State::RowsAtCompileTime> P = S.reconstructedMatrix();
-            S.compute( (P - K * H * P).eval() );
-            return (S.info() == Eigen::Success);
+            enum { dimS = State::RowsAtCompileTime , dimM = Measurement::RowsAtCompileTime };
+            // After some benchmarking, the following appears to be the fastest way to
+            // assemble the matrices and to recover the parts with all the intermediate
+            // back and forth between upper and lower triangular matrices.
+            Eigen::Matrix<T, dimS + dimM, dimS + dimM, Eigen::RowMajor> tmp;
+            auto tmpT = tmp.transpose(); // a useful abbreviation, note that this is a reference!
+            tmpT.template topLeftCorner<dimM, dimM>() = m.getCovarianceSquareRoot().matrixL();
+            tmpT.template topRightCorner<dimM, dimS>() = m.H * S.matrixL();
+            tmpT.template bottomLeftCorner<dimS, dimM>().fill(0);
+            tmpT.template bottomRightCorner<dimS, dimS>() = S.matrixL();
+
+            Eigen::HouseholderQR<Eigen::Ref<decltype(tmp)>> qr(tmp); // in-place QR decomposition.
+            // The Kalman gain ...
+            x += tmpT.template bottomLeftCorner<dimS, dimM>()
+                * tmpT.template topLeftCorner<dimM, dimM>()
+                    .template triangularView<Eigen::Lower>()
+                    .solve(z - m.h( x ));
+            // ... and the new covariance square root.
+            S.setL(tmpT.template bottomRightCorner<dimS, dimS>());
         }
     };
 }
